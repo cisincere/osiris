@@ -10,7 +10,7 @@
 
 -include("osiris.hrl").
 
--define(SUP, osiris_server_sup).
+-define(SUP, osiris_server_sup_sup).
 
 %% osiris replica, spaws remote reader, TCP listener
 %% replicates and confirms latest offset back to primary
