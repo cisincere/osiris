@@ -12,7 +12,10 @@
 -export([init/1]).
 -export([start/1, stop/1]).
 -export([is_children/1,
-         get_writer/2]).
+         get_writer/1,
+         get_writer/2,
+         get_crc/1,
+         get_crc/2]).
 
 -define(SUP, osiris_server_sup_sup).
 
@@ -26,7 +29,7 @@ init([#{name := Name} = Config]) ->
                shutdown => 5000,
                type => worker},
     Crc = #{id => crc_name(Name),
-            start => {osiris_competing_read_coordinator, start_link, [Config]},
+            start => {osiris_competing_read_coordinator, start_link, [Config, self()]},
             restart => temporary,
             shutdown => 5000,
             type => worker},
@@ -60,12 +63,32 @@ is_children(#{name := Name,
     end.
 
 get_writer(SupPid, #{name := Name}) ->
+    get_child(SupPid, writer_name(Name)).
+
+get_writer(#{name := Name}) ->
+    get_child(supervisor_name(Name), writer_name(Name)).
+
+get_crc(SupPid, #{name := Name}) ->
+    get_child(SupPid, crc_name(Name)).
+
+get_crc(#{name := Name}) ->
+    get_child(supervisor_name(Name), crc_name(Name)).
+
+get_child(SupPid, Name) when is_pid(SupPid) ->
     case [Pid || {Id, Pid, _, _} <- supervisor:which_children(SupPid),
-               Id == writer_name(Name)] of
+                 Id == Name] of
         [] ->
             {error, not_found};
         [Pid] ->
             {ok, Pid}
+    end;
+get_child(SupName, Name) ->
+    case [Pid || {Id, Pid, _, _} <- supervisor:which_children(osiris_server_sup_sup),
+                 Id == SupName] of
+        [] ->
+            {error, not_found};
+        [Pid] ->
+            get_child(Pid, Name)
     end.
 
 supervisor_name(Name) ->

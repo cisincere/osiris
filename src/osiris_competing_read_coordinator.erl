@@ -9,7 +9,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/1]).
+-export([start_link/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -17,7 +17,11 @@
 
 -define(SERVER, ?MODULE).
 
--record(state, {}).
+-record(state, {log,
+                config,
+                sup,
+                readers,
+                service_queue}).
 
 %%%===================================================================
 %%% API
@@ -28,12 +32,12 @@
 %% Starts the server
 %% @end
 %%--------------------------------------------------------------------
--spec start_link(term()) -> {ok, Pid :: pid()} |
+-spec start_link(term(), pid()) -> {ok, Pid :: pid()} |
           {error, Error :: {already_started, pid()}} |
           {error, Error :: term()} |
           ignore.
-start_link(_Config) ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+start_link(Config, SupPid) ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [Config, SupPid], []).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -50,9 +54,13 @@ start_link(_Config) ->
           {ok, State :: term(), hibernate} |
           {stop, Reason :: term()} |
           ignore.
-init([]) ->
+init([Config, SupPid]) ->
     process_flag(trap_exit, true),
-    {ok, #state{}}.
+    gen_server:cast(self(), init),
+    {ok, #state{config = Config,
+                sup = SupPid,
+                readers = #{},
+                service_queue = queue:new()}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -69,9 +77,17 @@ init([]) ->
           {noreply, NewState :: term(), hibernate} |
           {stop, Reason :: term(), Reply :: term(), NewState :: term()} |
           {stop, Reason :: term(), NewState :: term()}.
-handle_call(_Request, _From, State) ->
-    Reply = ok,
-    {reply, Reply, State}.
+handle_call({register, Pid, Prefetch, Fmt}, _From,
+            #state{readers = Readers,
+                   service_queue = SQ} = State) ->
+    %% TODO handle duplicated calls to 'register'
+    %% TODO monitor readers
+    {reply, ok, notify_readers(State#state{readers = maps:put(Pid, #{prefetch => Prefetch,
+                                                                     formatter => Fmt,
+                                                                     credit => Prefetch,
+                                                                     in_flight => gb_sets:new()},
+                                                              Readers),
+                                           service_queue = queue:in(Pid, SQ)})}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -84,7 +100,27 @@ handle_call(_Request, _From, State) ->
           {noreply, NewState :: term(), Timeout :: timeout()} |
           {noreply, NewState :: term(), hibernate} |
           {stop, Reason :: term(), NewState :: term()}.
-handle_cast(_Request, State) ->
+handle_cast(init, #state{config = Config,
+                         sup = SupPid} = State) ->
+    {ok, Writer} = osiris_server_sup:get_writer(SupPid, Config),
+    {ok, Ctx} = gen:call(Writer, '$gen_call', get_reader_context),
+    {ok, Seg} = osiris_log:init_offset_reader('first', Ctx),
+    {noreply, State#state{log = Seg}};
+handle_cast({ack, Reader, ChunkId}, #state{readers = Readers0,
+                                           service_queue = SQ0} = State) ->
+    %% TODO handle missing reader, uknown chunk id
+    #{credit := C0,
+      in_flight := InFlight0} = Cfg0 = maps:get(Reader, Readers0),
+    Cfg = Cfg0#{in_flight => gb_sets:del_element(ChunkId, InFlight0),
+                credit => C0 + 1},
+    Readers = Readers0#{Reader => Cfg},
+    case C0 of
+        0 ->
+            {noreply, notify_readers(State#state{readers = Readers,
+                                                 service_queue = queue:in(Reader, SQ0)})};
+        _ ->
+            {noreply, notify_readers(State#state{readers = Readers})}
+    end,
     {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -144,3 +180,40 @@ format_status(_Opt, Status) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+notify_readers(#state{log = Seg0,
+                      service_queue = SQ0,
+                      readers = Readers0} = State) ->
+    %% TODO deliver a few chunks at a time to each reader
+    case queue:peek(SQ0) of
+        {value, Reader} ->
+            case osiris_log:read_header(Seg0) of
+                {ok, #{chunk_id := ChunkId}, Seg} ->
+                    #{formatter := Fmt,
+                      credit := C0,
+                      in_flight := InFlight0} = Cfg0 = maps:get(Reader, Readers0),
+                    Reader ! wrap_event(Fmt, {osiris_chunk, ChunkId}),
+                    C = C0 - 1,
+                    Cfg = Cfg0#{in_flight => gb_sets:add_element(ChunkId, InFlight0),
+                                credit => C},
+                    Readers = Readers0#{Reader => Cfg},
+                    case C of
+                        0 ->
+                            notify_readers(State#state{log = Seg,
+                                                       readers = Readers,
+                                                       service_queue = queue:drop(SQ0)});
+                        _ ->
+                            %% Reader has a higher prefetch but we deliver a limited number
+                            %% of chunks every time. It has to move to the tail of the queue
+                            notify_readers(State#state{log = Seg,
+                                                       readers = Readers,
+                                                       service_queue = queue:in(Reader, queue:drop(SQ0))})
+                    end;
+                {end_of_stream, Seg} ->
+                    State#state{log = Seg}
+            end;
+        empty ->
+            State
+    end.
+
+wrap_event(Fmt, Evt) ->
+    Fmt(Evt).

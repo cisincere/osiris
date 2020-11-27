@@ -52,7 +52,8 @@ all_tests() ->
      single_node_deduplication_2,
      cluster_minority_deduplication,
      cluster_deduplication,
-     writers_retention
+     writers_retention,
+     osiris_crc
     ].
 
 -define(BIN_SIZE, 800).
@@ -884,6 +885,38 @@ writers_retention(Config) ->
     ?assert(map_size(Writers) < 256),
 
     %% validate there are only a single entry
+    ok.
+
+osiris_crc(Config) ->
+    Name = ?config(cluster_name, Config),
+    Conf0 = #{name => Name,
+              epoch => 1,
+              leader_node => node(),
+              replica_nodes => [],
+              dir => ?config(priv_dir, Config)},
+    {ok, #{leader_pid := Leader}} = osiris:start_cluster(Conf0),
+    Wid = <<"wid1">>,
+    ?assertEqual(undefined, osiris:fetch_writer_seq(Leader, Wid)),
+    ok = osiris:write(Leader, Wid, 42, <<"mah-data">>),
+    receive
+        {osiris_written, _Name, _WriterId, [42]} ->
+            ok
+    after 2000 ->
+              flush(),
+              exit(osiris_written_timeout)
+    end,
+
+    {ok, CRC} = osiris_server_sup:get_crc(Conf0),
+    gen_server:call(CRC, {register, self(), 2, fun(V) -> V end}),
+
+    %% TODO need more chunks to verify ack and continue sending!!
+    receive
+        {osiris_chunk, ChunkId} ->
+            gen_server:cast(CRC, {ack, self(), ChunkId})
+    after 10000 ->
+            flush(),
+            exit(osiris_chunk_timeout)
+    end,
     ok.
 
 %% Utility
